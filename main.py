@@ -11,13 +11,12 @@ import platform
 import smtplib
 from email.message import EmailMessage
 
-
-
 RECV_DIR = Path("received_files")
 LOG_FILE = "network_app.log"
 TCP_HEADER_FMT = "!I"
 TCP_HEADER_LEN = struct.calcsize(TCP_HEADER_FMT)
 MULTIPROC_THRESHOLD = 1 * 1024 * 1024
+UDP_FILE_THRESHOLD = 512 * 1024
 
 logger = logging.getLogger("net_app")
 logger.setLevel(logging.DEBUG)
@@ -73,10 +72,8 @@ def send_tcp_message(host: str, port: int, header: dict, payload_reader, retries
             attempt += 1
             logger.error("Ошибка соединения при отправке файла: %s (попытка %d/%d)", e, attempt, retries)
             if attempt < retries:
-                logger.info("Повторная попытка через 2 секунды...")
                 time.sleep(2)
             else:
-                logger.error("Не удалось отправить файл после %d попыток", retries)
                 raise
         except Exception as e:
             logger.exception("Неожиданная ошибка при отправке файла: %s", e)
@@ -84,46 +81,35 @@ def send_tcp_message(host: str, port: int, header: dict, payload_reader, retries
 
 def recv_tcp_data(conn: socket.socket, header: dict, addr, tag: str):
     try:
-        payload_type = header.get("type", "message")
-        if payload_type == "file":
-            filename = header.get("filename", "unknown.bin")
-            expected_size = int(header.get("size", -1))
-            save_name = timestamped_filename(filename)
-            ensure_recv_dir()
-            target_path = RECV_DIR / save_name
-            bytes_received = 0
-            last_update = time.time()
-            with open(target_path, "wb") as f:
-                if expected_size >= 0:
-                    while bytes_received < expected_size:
-                        chunk = conn.recv(min(64 * 1024, expected_size - bytes_received))
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        bytes_received += len(chunk)
-                        now = time.time()
-                        if now - last_update >= 0.5 or bytes_received == expected_size:
-                            percent = (bytes_received / expected_size * 100) if expected_size else 0
-                            print(f"\rПринято: {bytes_received}/{expected_size} байт ({percent:.2f}%)", end="", flush=True)
-                            last_update = now
-                else:
-                    while True:
-                        chunk = conn.recv(64 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        bytes_received += len(chunk)
-            print("\nПриём завершён")
-            logger.info(f"Файл сохранён ({tag}) от {addr} -> {target_path} ({bytes_received} байт)")
-        else:
-            data_chunks = []
-            while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                data_chunks.append(chunk)
-            text = b"".join(data_chunks).decode("utf-8", errors="replace")
-            logger.info(f"Сообщение получено ({tag}) от {addr}: {text}")
+        filename = header.get("filename", "unknown.bin")
+        expected_size = int(header.get("size", -1))
+        save_name = timestamped_filename(filename)
+        ensure_recv_dir()
+        target_path = RECV_DIR / save_name
+        bytes_received = 0
+        last_update = time.time()
+        with open(target_path, "wb") as f:
+            if expected_size >= 0:
+                while bytes_received < expected_size:
+                    chunk = conn.recv(min(64 * 1024, expected_size - bytes_received))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    bytes_received += len(chunk)
+                    now = time.time()
+                    if now - last_update >= 0.5 or bytes_received == expected_size:
+                        percent = (bytes_received / expected_size * 100) if expected_size else 0
+                        print(f"\rПринято: {bytes_received}/{expected_size} байт ({percent:.2f}%)", end="", flush=True)
+                        last_update = now
+            else:
+                while True:
+                    chunk = conn.recv(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    bytes_received += len(chunk)
+        print("\nПриём завершён")
+        logger.info(f"Файл сохранён ({tag}) от {addr} -> {target_path} ({bytes_received} байт)")
     finally:
         conn.close()
 
@@ -137,14 +123,17 @@ def udp_handler_loop(host: str, port: int, stop_event: threading.Event):
                 data, addr = s.recvfrom(65536)
             except socket.timeout:
                 continue
-            try:
-                decoded = data.decode("utf-8")
-                payload = json.loads(decoded)
-                text = payload.get("message", "")
-                logger.info("UDP сообщение от %s: %s", addr, text)
-            except Exception:
-                text = data.decode("utf-8", errors="replace")
-                logger.info("UDP текст от %s: %s", addr, text)
+            header_end = data.find(b"\n")
+            if header_end == -1:
+                continue
+            header = json.loads(data[:header_end].decode("utf-8"))
+            payload = data[header_end + 1:]
+            filename = header.get("filename", "udp_file.bin")
+            ensure_recv_dir()
+            target_path = RECV_DIR / timestamped_filename(filename)
+            with open(target_path, "wb") as f:
+                f.write(payload)
+            logger.info(f"Файл получен по UDP от {addr} -> {target_path}")
 
 class NetworkServer:
     def __init__(self, host="127.0.0.1", tcp_port=9000, udp_port=9001):
@@ -155,9 +144,9 @@ class NetworkServer:
 
     def start(self):
         ensure_recv_dir()
-        logger.info("Сервер запущен (TCP %d / UDP %d) на %s", self.tcp_port, self.udp_port, self.host)
         threading.Thread(target=udp_handler_loop, args=(self.host, self.udp_port, self.stop_event), daemon=True).start()
         threading.Thread(target=self.tcp_accept_loop, daemon=True).start()
+        logger.info("Сервер запущен (TCP %d / UDP %d)", self.tcp_port, self.udp_port)
 
     def tcp_accept_loop(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -165,7 +154,6 @@ class NetworkServer:
             s.bind((self.host, self.tcp_port))
             s.listen(5)
             s.settimeout(1.0)
-            logger.info("TCP сервер слушает %s:%d", self.host, self.tcp_port)
             while not self.stop_event.is_set():
                 try:
                     conn, addr = s.accept()
@@ -175,7 +163,6 @@ class NetworkServer:
 
     def _tcp_initial_handler(self, conn, addr):
         try:
-            conn.settimeout(5.0)
             data = conn.recv(TCP_HEADER_LEN)
             if len(data) < TCP_HEADER_LEN:
                 conn.close()
@@ -197,43 +184,39 @@ class NetworkServer:
             else:
                 threading.Thread(target=recv_tcp_data, args=(conn, header, addr, "поток"), daemon=True).start()
         except Exception as e:
-            logger.exception("Ошибка в обработчике TCP для %s: %s", addr, e)
+            logger.exception("Ошибка TCP: %s", e)
             try:
                 conn.close()
-            except Exception:
+            except:
                 pass
 
-
     def stop(self):
-        logger.info("Остановка сервера...")
         self.stop_event.set()
-        logger.info("Сервер остановлен.")
+        logger.info("Сервер остановлен")
 
 class NetworkClient:
     def __init__(self, host="127.0.0.1"):
         self.host = host
 
-    def send_message(self, message: str):
-        port = 9001
-        packet = json.dumps({"type": "message", "message": message}, ensure_ascii=False).encode("utf-8")
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.sendto(packet, (self.host, port))
-            logger.info("Сообщение отправлено по UDP")
-        except Exception as e:
-            logger.exception("Ошибка при отправке UDP-сообщения: %s", e)
-
-
     def send_file(self, file_path: str):
-        port = 9000  
         p = Path(file_path)
         if not p.exists() or not p.is_file():
             raise FileNotFoundError(file_path)
         size = p.stat().st_size
-        header = {"type": "file", "filename": p.name, "size": size}
-        with open(p, "rb") as f:
-            send_tcp_message(self.host, port, header, f)
-        logger.info("Файл отправлен по TCP")
+        protocol = "UDP" if size <= UDP_FILE_THRESHOLD else "TCP"
+        if protocol == "UDP":
+            header = {"type": "file", "filename": p.name, "size": size}
+            with open(p, "rb") as f:
+                data = f.read()
+            packet = json.dumps(header, ensure_ascii=False).encode("utf-8") + b"\n" + data
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.sendto(packet, (self.host, 9001))
+            logger.info("Файл отправлен по UDP")
+        else:
+            header = {"type": "file", "filename": p.name, "size": size}
+            with open(p, "rb") as f:
+                send_tcp_message(self.host, 9000, header, f)
+            logger.info("Файл отправлен по TCP")
 
     def send_email_gmail(self, sender_email, app_password, recipients, subject, body, attachments=None):
         msg = EmailMessage()
@@ -245,39 +228,20 @@ class NetworkClient:
             for path in attachments:
                 p = Path(path)
                 if not p.exists():
-                    logger.warning(f"Файл не найден: {path}, пропускаю")
                     continue
                 with open(p, "rb") as f:
                     data = f.read()
-                msg.add_attachment(
-                    data,
-                    maintype="application",
-                    subtype="octet-stream",
-                    filename=p.name
-                )
-                logger.info(f"Вложение добавлено: {p.name}")
-
-        try:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-                smtp.login(sender_email, app_password)
-                smtp.send_message(msg)
-            logger.info(f"Письмо успешно отправлено на {msg['To']}")
-            print("✅ Письмо успешно отправлено!")
-        except smtplib.SMTPAuthenticationError:
-            print("❌ Ошибка авторизации! Проверь логин и пароль приложения Gmail.")
-            logger.exception("Ошибка авторизации Gmail.")
-        except Exception as e:
-            print(f"❌ Ошибка при отправке письма: {e}")
-            logger.exception("Ошибка при отправке email.")
-                
-
+                msg.add_attachment(data, maintype="application", subtype="octet-stream", filename=p.name)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(sender_email, app_password)
+            smtp.send_message(msg)
+        logger.info("Письмо отправлено")
 
 def main():
     choice = input("Выберите режим (1 - сервер, 2 - клиент): ").strip()
     if choice == "1":
         srv = NetworkServer()
         srv.start()
-        logger.info("Нажмите Ctrl+C для остановки")
         try:
             while True:
                 time.sleep(1)
@@ -288,36 +252,24 @@ def main():
         client = NetworkClient(host)
         while True:
             print("\nВыберите действие:")
-            print("m - Отправить сообщение (UDP)")
-            print("f - Отправить файл (TCP)")
-            print("e - Отправить email через Gmail")  # 🆕
+            print("f - Отправить файл")
+            print("e - Отправить email через Gmail")
             print("0 - Выйти")
             action = input("Ваш выбор: ").strip().lower()
-
-            if action == "m":
-                msg = input("Введите сообщение: ")
-                client.send_message(msg)
-            elif action == "f":
+            if action == "f":
                 path = input("Путь к файлу: ").strip()
                 client.send_file(path)
             elif action == "e":
                 sender = input("Ваш Gmail: ").strip()
                 app_pass = input("Пароль приложения Gmail: ").strip()
-                to_addrs = [a.strip() for a in input("Кому (через запятую): ").strip().split(",") if a.strip()]  
-                if not to_addrs:
-                    print("❌ Не указан получатель!")
-                    continue
+                to_addrs = [a.strip() for a in input("Кому (через запятую): ").strip().split(",") if a.strip()]
                 subject = input("Тема письма: ").strip()
                 body = input("Текст письма: ").strip()
                 attach_str = input("Пути к файлам через запятую (или пусто): ").strip()
                 attachments = [a.strip() for a in attach_str.split(",") if a.strip()] if attach_str else None
-
                 client.send_email_gmail(sender, app_pass, to_addrs, subject, body, attachments)
             elif action == "0":
-                print("Выход из клиента...")
                 break
-            else:
-                print("Неверный выбор")
 
 if __name__ == "__main__":
     main()
