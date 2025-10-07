@@ -8,6 +8,10 @@ import time
 from pathlib import Path
 from datetime import timezone, datetime
 import platform
+import smtplib
+from email.message import EmailMessage
+
+
 
 RECV_DIR = Path("received_files")
 LOG_FILE = "network_app.log"
@@ -221,7 +225,7 @@ class NetworkClient:
 
 
     def send_file(self, file_path: str):
-        port = 9000  # TCP
+        port = 9000  
         p = Path(file_path)
         if not p.exists() or not p.is_file():
             raise FileNotFoundError(file_path)
@@ -230,6 +234,43 @@ class NetworkClient:
         with open(p, "rb") as f:
             send_tcp_message(self.host, port, header, f)
         logger.info("Файл отправлен по TCP")
+
+    def send_email_gmail(self, sender_email, app_password, recipients, subject, body, attachments=None):
+        msg = EmailMessage()
+        msg["From"] = sender_email
+        msg["To"] = ", ".join(recipients) if isinstance(recipients, list) else recipients
+        msg["Subject"] = subject
+        msg.set_content(body)
+        if attachments:
+            for path in attachments:
+                p = Path(path)
+                if not p.exists():
+                    logger.warning(f"Файл не найден: {path}, пропускаю")
+                    continue
+                with open(p, "rb") as f:
+                    data = f.read()
+                msg.add_attachment(
+                    data,
+                    maintype="application",
+                    subtype="octet-stream",
+                    filename=p.name
+                )
+                logger.info(f"Вложение добавлено: {p.name}")
+
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+                smtp.login(sender_email, app_password)
+                smtp.send_message(msg)
+            logger.info(f"Письмо успешно отправлено на {msg['To']}")
+            print("✅ Письмо успешно отправлено!")
+        except smtplib.SMTPAuthenticationError:
+            print("❌ Ошибка авторизации! Проверь логин и пароль приложения Gmail.")
+            logger.exception("Ошибка авторизации Gmail.")
+        except Exception as e:
+            print(f"❌ Ошибка при отправке письма: {e}")
+            logger.exception("Ошибка при отправке email.")
+                
+
 
 def main():
     choice = input("Выберите режим (1 - сервер, 2 - клиент): ").strip()
@@ -247,23 +288,36 @@ def main():
         client = NetworkClient(host)
         while True:
             print("\nВыберите действие:")
-            print("m - Отправить сообщение")
-            print("f - Отправить файл")
+            print("m - Отправить сообщение (UDP)")
+            print("f - Отправить файл (TCP)")
+            print("e - Отправить email через Gmail")  # 🆕
             print("0 - Выйти")
             action = input("Ваш выбор: ").strip().lower()
+
             if action == "m":
                 msg = input("Введите сообщение: ")
                 client.send_message(msg)
             elif action == "f":
                 path = input("Путь к файлу: ").strip()
                 client.send_file(path)
+            elif action == "e":
+                sender = input("Ваш Gmail: ").strip()
+                app_pass = input("Пароль приложения Gmail: ").strip()
+                to_addrs = [a.strip() for a in input("Кому (через запятую): ").strip().split(",") if a.strip()]  
+                if not to_addrs:
+                    print("❌ Не указан получатель!")
+                    continue
+                subject = input("Тема письма: ").strip()
+                body = input("Текст письма: ").strip()
+                attach_str = input("Пути к файлам через запятую (или пусто): ").strip()
+                attachments = [a.strip() for a in attach_str.split(",") if a.strip()] if attach_str else None
+
+                client.send_email_gmail(sender, app_pass, to_addrs, subject, body, attachments)
             elif action == "0":
                 print("Выход из клиента...")
                 break
             else:
                 print("Неверный выбор")
-    else:
-        print("Неверный выбор")
 
 if __name__ == "__main__":
     main()
